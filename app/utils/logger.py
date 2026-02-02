@@ -5,8 +5,10 @@ from pathlib import Path
 # Application name (used in logs)
 APP_NAME = "newspaper_service"
 
-# Base log directory (next to project root)
-LOG_DIR = Path(__file__).resolve().parents[2]
+# Absolute log directory inside container
+LOG_DIR = Path("/app/logs")
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+
 LOG_FILE = LOG_DIR / "cron.log"
 
 

@@ -1,8 +1,10 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -e
 
-export PATH=/usr/local/bin:/usr/bin:/bin
+# Resolve project root based on script location
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-cd /home/mahdi/Documents/newspaper_service/docker
+# Go to docker directory
+cd "$SCRIPT_DIR/docker"
 
-docker compose run --rm app >> /home/mahdi/Documents/newspaper_service/cron.log 2>&1
+docker compose run --rm app
