@@ -7,6 +7,10 @@ from urllib.parse import urljoin
 from datetime import datetime
 from bs4 import BeautifulSoup
 
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from requests.exceptions import ConnectionError, Timeout, RequestException
+
 from app.scrapers.base import BaseScraper
 from app.services.redis_client import RedisClient
 from app.services.image_builder import build_cover_png
@@ -18,25 +22,54 @@ class PishkhanScraper(BaseScraper):
     multi_issue = True
     BASE_URL = "https://www.pishkhan.com"
 
+    # --------------------------------------------------
+    # Init
+    # --------------------------------------------------
     def __init__(self):
-        self.session = requests.Session()
-        self.session.headers.update({
+        self.session = self._init_session()
+        self.redis = RedisClient()
+
+    def _init_session(self) -> requests.Session:
+        """Create requests session with retry & backoff (DNS-safe)."""
+
+        retry = Retry(
+            total=3,
+            connect=3,
+            read=3,
+            backoff_factor=1.5,
+            allowed_methods=["GET", "POST"],
+            raise_on_status=False,
+        )
+
+        adapter = HTTPAdapter(max_retries=retry)
+
+        session = requests.Session()
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+
+        session.headers.update({
             "User-Agent": "Mozilla/5.0",
             "Accept": "text/html,application/pdf",
         })
-        self.redis = RedisClient()
+
+        return session
 
     # --------------------------------------------------
     # Helpers
     # --------------------------------------------------
-    def _get_today_shamsi(self) -> str:
-        r = self.session.get(f"{self.BASE_URL}/all", timeout=(5,20))
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
+    def _fetch_all_page(self) -> BeautifulSoup:
+        """Fetch /all page once and return parsed soup."""
+        try:
+            r = self.session.get(f"{self.BASE_URL}/all", timeout=(5, 20))
+            r.raise_for_status()
+            return BeautifulSoup(r.text, "html.parser")
+        except (ConnectionError, Timeout) as e:
+            raise RuntimeError("Network/DNS error while connecting to Pishkhan") from e
 
+    def _extract_shamsi_date(self, soup: BeautifulSoup) -> str:
         date_tag = soup.select_one(".mash-list-items.right p")
         if not date_tag:
-            raise RuntimeError("Cannot detect Shamsi date")
+            raise RuntimeError("Shamsi date not found on Pishkhan page")
 
         digits = re.findall(r"\d+", date_tag.text)
         return "".join(digits)
@@ -59,11 +92,7 @@ class PishkhanScraper(BaseScraper):
     # --------------------------------------------------
     # Collect viewer links
     # --------------------------------------------------
-    def _collect_viewers(self, shamsi_date: str) -> list[str]:
-        r = self.session.get(f"{self.BASE_URL}/all", timeout=(5,20))
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
-
+    def _collect_viewers(self, soup: BeautifulSoup) -> list[str]:
         date_tag = soup.select_one(".mash-list-items.right p")
         if not date_tag:
             return []
@@ -89,8 +118,12 @@ class PishkhanScraper(BaseScraper):
     # Extract real PDF URL
     # --------------------------------------------------
     def _extract_pdf(self, viewer_url: str):
-        r = self.session.get(viewer_url, timeout=(5, 20))
-        r.raise_for_status()
+        try:
+            r = self.session.get(viewer_url, timeout=(5, 20))
+            r.raise_for_status()
+        except RequestException:
+            return None
+
         text = r.text
 
         match_paper = re.search(r"pdfviewer\.php\?paper=([^&]+)", viewer_url)
@@ -112,12 +145,15 @@ class PishkhanScraper(BaseScraper):
             "id": issue.group(1),
         }
 
-        resp = self.session.post(
-            f"{self.BASE_URL}/tools/PDFFiles/PDFFiles.php",
-            data=payload,
-            headers={"X-Requested-With": "XMLHttpRequest"},
-            timeout=(5,20),
-        )
+        try:
+            resp = self.session.post(
+                f"{self.BASE_URL}/tools/PDFFiles/PDFFiles.php",
+                data=payload,
+                headers={"X-Requested-With": "XMLHttpRequest"},
+                timeout=(5, 20),
+            )
+        except RequestException:
+            return None
 
         pdf_rel_path = resp.text.strip()
         if not pdf_rel_path or pdf_rel_path == "null":
@@ -126,13 +162,14 @@ class PishkhanScraper(BaseScraper):
         return paper_name, date.group(1), urljoin(self.BASE_URL, pdf_rel_path)
 
     # --------------------------------------------------
-    # Core download (with website-level try/except)
+    # Core download
     # --------------------------------------------------
     def download(self, temp_dir: Path) -> Path:
         try:
-            shamsi_date = self._get_today_shamsi()
+            soup = self._fetch_all_page()
+            shamsi_date = self._extract_shamsi_date(soup)
             gregorian_date = self._today_gregorian()
-            viewers = self._collect_viewers(shamsi_date)
+            viewers = self._collect_viewers(soup)
 
             output_root = Path("/app/output/data") / self.agency
             output_root.mkdir(parents=True, exist_ok=True)
@@ -166,18 +203,13 @@ class PishkhanScraper(BaseScraper):
 
                     pdf_path.write_bytes(r.content)
 
-                    #  build cover
                     try:
-                        build_cover_png(
-                            pdf_path=pdf_path,
-                            output_png=png_path,
-                            dpi=200,
-                        )
+                        build_cover_png(pdf_path, png_path, dpi=200)
                     except Exception as e:
-                        logger.warning("Cover failed: %s (%s)", pdf_path, e)
+                        logger.warning("Cover build failed: %s (%s)", pdf_path, e)
 
-                except Exception as e:
-                    logger.warning("Download failed: %s (%s)", pdf_url, e)
+                except RequestException as e:
+                    logger.warning("PDF download failed: %s (%s)", pdf_url, e)
                     continue
 
                 self.redis.record_download(
@@ -198,9 +230,11 @@ class PishkhanScraper(BaseScraper):
             if downloaded == 0:
                 logger.warning("No new PDFs from Pishkhan")
 
+        except RuntimeError as e:
+            logger.error("Pishkhan network/structure error: %s", e)
+
         except Exception:
-            # Website / network / structure protection
-            logger.exception("Pishkhan scraper failed due to website or network issue")
+            logger.exception("Unexpected Pishkhan scraper failure")
 
         finally:
             done_file = temp_dir / "pishkhan.done"

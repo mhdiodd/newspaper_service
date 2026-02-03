@@ -59,9 +59,11 @@ def run(scraper, agency: str, base_dir: Path):
             final_dir = data_root / agency / today
             final_dir.mkdir(parents=True, exist_ok=True)
 
-            final_pdf = final_dir / f"{agency}.pdf"
-            final_png = final_dir / f"{agency}.png"
-
+            ts = int(time.time())
+            final_pdf = final_dir / f"{agency}-{ts}.pdf"
+            final_png = final_dir / f"{agency}-{ts}.png"
+    
+           
             result.replace(final_pdf)
 
             try:
