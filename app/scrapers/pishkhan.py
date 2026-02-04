@@ -14,6 +14,7 @@ from requests.exceptions import ConnectionError, Timeout, RequestException
 from app.scrapers.base import BaseScraper
 from app.services.redis_client import RedisClient
 from app.services.image_builder import build_cover_png
+from app.services.object_storage import CompositeStorage
 from app.utils.logger import logger
 
 
@@ -28,10 +29,9 @@ class PishkhanScraper(BaseScraper):
     def __init__(self):
         self.session = self._init_session()
         self.redis = RedisClient()
+        self.storage = CompositeStorage()
 
     def _init_session(self) -> requests.Session:
-        """Create requests session with retry & backoff (DNS-safe)."""
-
         retry = Retry(
             total=3,
             connect=3,
@@ -58,7 +58,6 @@ class PishkhanScraper(BaseScraper):
     # Helpers
     # --------------------------------------------------
     def _fetch_all_page(self) -> BeautifulSoup:
-        """Fetch /all page once and return parsed soup."""
         try:
             r = self.session.get(f"{self.BASE_URL}/all", timeout=(5, 20))
             r.raise_for_status()
@@ -162,7 +161,7 @@ class PishkhanScraper(BaseScraper):
         return paper_name, date.group(1), urljoin(self.BASE_URL, pdf_rel_path)
 
     # --------------------------------------------------
-    # Core download
+    # Core download + Dual Write
     # --------------------------------------------------
     def download(self, temp_dir: Path) -> Path:
         try:
@@ -212,20 +211,38 @@ class PishkhanScraper(BaseScraper):
                     logger.warning("PDF download failed: %s (%s)", pdf_url, e)
                     continue
 
+                # -------- Dual Write --------
+                pdf_remote_key = f"{self.agency}/{paper}/{gregorian_date}/{pdf_path.name}"
+                png_remote_key = f"{self.agency}/{paper}/{gregorian_date}/{png_path.name}"
+
+                pdf_remote_uri = self.storage.save(pdf_path, pdf_remote_key)
+                png_remote_uri = (
+                    self.storage.save(png_path, png_remote_key)
+                    if png_path.exists()
+                    else None
+                )
+
                 self.redis.record_download(
                     agency=self.agency,
                     issue_no=pdf_issue_id,
                     payload={
                         "paper": paper,
                         "shamsi_date": pdf_shamsi_date,
-                        "pdf": str(pdf_path),
-                        "png": str(png_path) if png_path.exists() else None,
+                        "gregorian_date": gregorian_date,
+                        "pdf": {
+                            "local": str(pdf_path),
+                            "remote": pdf_remote_uri,
+                        },
+                        "png": {
+                            "local": str(png_path) if png_path.exists() else None,
+                            "remote": png_remote_uri,
+                        },
                         "timestamp": ts,
                     },
                 )
 
                 downloaded += 1
-                logger.info("Saved PDF: %s", pdf_path)
+                logger.info("Saved PDF (dual): %s", pdf_path)
 
             if downloaded == 0:
                 logger.warning("No new PDFs from Pishkhan")

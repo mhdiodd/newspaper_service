@@ -1,10 +1,13 @@
+
 services:
   app:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+    container_name: newspaper_app
     depends_on:
       - redis
+      - minio
     volumes:
       - ../temp:/app/temp
       - ../output:/app/output
@@ -16,3 +19,19 @@ services:
     container_name: newspaper_redis
     ports:
       - "6379:6379"
+
+  minio:
+    image: minio/minio:latest
+    container_name: newspaper_minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Web Console
+
+volumes:
+  minio_data:

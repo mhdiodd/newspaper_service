@@ -14,3 +14,10 @@ DOWNLOAD_TTL_DAYS = 2
 
 # ---------- Scheduler ----------
 RUN_HOURS = "0,6,12,18"
+
+# ---------- S3 / MinIO ----------
+S3_ENDPOINT = "minio:9000"
+S3_ACCESS_KEY = "minioadmin"
+S3_SECRET_KEY = "minioadmin"
+S3_BUCKET = "newspapers"
+S3_SECURE = False

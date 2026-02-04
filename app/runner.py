@@ -4,14 +4,15 @@ from pathlib import Path
 
 from app.services.redis_client import RedisClient
 from app.services.image_builder import build_cover_png
+from app.services.object_storage import CompositeStorage
 from app.utils.file_manager import cleanup_temp
-from app.config import TEMP_DIR
 
 logger = logging.getLogger(__name__)
 
 
 def run(scraper, agency: str, base_dir: Path):
     redis = RedisClient()
+    storage = CompositeStorage()
 
     tmp_root = base_dir / "tmp"
     data_root = base_dir / "data"
@@ -45,7 +46,8 @@ def run(scraper, agency: str, base_dir: Path):
 
             result = scraper.download(temp_dir)
 
-            # Multi-issue ends here (Pishkhan)
+            # ---------------- MULTI ISSUE ----------------
+            # (e.g. Pishkhan – handled inside scraper)
             if getattr(scraper, "multi_issue", False):
                 logger.info("Multi-issue scraper finished successfully")
                 return
@@ -60,12 +62,14 @@ def run(scraper, agency: str, base_dir: Path):
             final_dir.mkdir(parents=True, exist_ok=True)
 
             ts = int(time.time())
+
             final_pdf = final_dir / f"{agency}-{ts}.pdf"
             final_png = final_dir / f"{agency}-{ts}.png"
-    
-           
+
+            # Move PDF to final location
             result.replace(final_pdf)
 
+            # Build PNG cover
             try:
                 build_cover_png(
                     pdf_path=final_pdf,
@@ -75,18 +79,41 @@ def run(scraper, agency: str, base_dir: Path):
             except Exception:
                 logger.exception("Cover generation failed")
 
+            # -------- STORAGE (LOCAL + S3) --------
+            pdf_remote_key = f"{agency}/{today}/{final_pdf.name}"
+            png_remote_key = f"{agency}/{today}/{final_png.name}"
+
+            pdf_uri = storage.save(final_pdf, pdf_remote_key)
+            png_uri = None
+
+            if final_png.exists():
+                png_uri = storage.save(final_png, png_remote_key)
+
+            # -------- REDIS METADATA --------
             redis.record_download(
                 agency=agency,
                 issue_no=issue_id,
                 payload={
-                    "pdf": final_pdf.name,
-                    "png": final_png.name if final_png.exists() else None,
-                    "timestamp": int(time.time()),
+                    "pdf": {
+                        "local": str(final_pdf),
+                        "remote": pdf_uri,
+                    },
+                    "png": {
+                        "local": str(final_png) if final_png.exists() else None,
+                        "remote": png_uri,
+                    },
+                    "timestamp": ts,
                 },
             )
 
+            logger.info(
+                "Single issue processed successfully: agency=%s issue_id=%s",
+                agency,
+                issue_id,
+            )
+
     finally:
-        #  CLEAN TEMP
+        # -------- CLEAN TEMP --------
         try:
             cleanup_temp()
         except Exception:
